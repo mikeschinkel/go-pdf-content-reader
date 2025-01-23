@@ -4,7 +4,7 @@
 
 // Package pdf implements reading of PDF files.
 //
-// Overview
+// # Overview
 //
 // PDF is Adobe's Portable Document Format, ubiquitous on the internet.
 // A PDF document is a complex data format built on a fairly simple structure.
@@ -43,7 +43,6 @@
 // they are implemented only in terms of the Value API and could be moved outside
 // the package. Equally important, traversal of other PDF data structures can be implemented
 // in other packages as needed.
-//
 package pdf
 
 // BUG(rsc): The package is incomplete, although it has been used successfully on some
@@ -68,9 +67,10 @@ import (
 	"crypto/md5"
 	"crypto/rc4"
 	"encoding/ascii85"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"maps"
 	"os"
 	"sort"
 	"strconv"
@@ -80,11 +80,15 @@ import (
 type Reader struct {
 	f          io.ReaderAt
 	end        int64
-	xref       []xref
+	xrefs      []xref
 	trailer    dict
-	trailerptr objptr
+	trailerPtr objptr
 	key        []byte
 	useAES     bool
+}
+
+func (r *Reader) Close() error {
+	return r.f.(*os.File).Close()
 }
 
 type xref struct {
@@ -103,12 +107,12 @@ func Open(file string) (*Reader, error) {
 	// TODO: Deal with closing file.
 	f, err := os.Open(file)
 	if err != nil {
-		f.Close()
+		mustClose(f)
 		return nil, err
 	}
 	fi, err := f.Stat()
 	if err != nil {
-		f.Close()
+		mustClose(f)
 		return nil, err
 	}
 	return NewReader(f, fi.Size())
@@ -123,58 +127,78 @@ func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 // If the PDF is encrypted, NewReaderEncrypted calls pw repeatedly to obtain passwords
 // to try. If pw returns the empty string, NewReaderEncrypted stops trying to decrypt
 // the file and returns an error.
-func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (*Reader, error) {
-	buf := make([]byte, 10)
-	f.ReadAt(buf, 0)
-	if !bytes.HasPrefix(buf, []byte("%PDF-1.")) || buf[7] < '0' || buf[7] > '7' || buf[8] != '\r' && buf[8] != '\n' {
-		return nil, fmt.Errorf("not a PDF file: invalid header")
-	}
-	end := size
+func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader, err error) {
 	const endChunk = 100
+	var end, pos, startxref int64
+	var b *buffer
+	var ok bool
+	var index int
+	var xrt xrefTable
+
+	buf := make([]byte, 10)
+	_, err = f.ReadAt(buf, 0)
+	if err != nil {
+		goto end
+	}
+	if !bytes.HasPrefix(buf, []byte("%PDF-1.")) || buf[7] < '0' || buf[7] > '7' || buf[8] != '\r' && buf[8] != '\n' {
+		err = ErrInvalid.FileHeader
+		goto end
+	}
+	end = size
 	buf = make([]byte, endChunk)
-	f.ReadAt(buf, end-endChunk)
+	_, err = f.ReadAt(buf, end-endChunk)
+	if err != nil {
+		goto end
+	}
 	for len(buf) > 0 && buf[len(buf)-1] == '\n' || buf[len(buf)-1] == '\r' {
 		buf = buf[:len(buf)-1]
 	}
 	buf = bytes.TrimRight(buf, "\r\n\t ")
 	if !bytes.HasSuffix(buf, []byte("%%EOF")) {
-		return nil, fmt.Errorf("not a PDF file: missing %%%%EOF")
+		err = ErrInvalid.MissingEOF
+		goto end
 	}
-	i := findLastLine(buf, "startxref")
-	if i < 0 {
-		return nil, fmt.Errorf("malformed PDF file: missing final startxref")
+	index = findLastLine(buf, "startxref")
+	if index < 0 {
+		err = ErrMalformedPDF.MissingFinalStartXRef
+		goto end
 	}
 
-	r := &Reader{
+	r = &Reader{
 		f:   f,
 		end: end,
 	}
-	pos := end - endChunk + int64(i)
-	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
+	pos = end - endChunk + int64(index)
+	b = newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
 	if b.readToken() != keyword("startxref") {
-		return nil, fmt.Errorf("malformed PDF file: missing startxref")
+		err = ErrMalformedPDF.MissingFirstStartXRef
+		goto end
 	}
-	startxref, ok := b.readToken().(int64)
+	startxref, ok = b.readToken().(int64)
 	if !ok {
-		return nil, fmt.Errorf("malformed PDF file: startxref not followed by integer")
+		err = ErrMalformedPDF.NoIntAfterStartXRef
+		goto end
 	}
 	b = newBuffer(io.NewSectionReader(r.f, startxref, r.end-startxref), startxref)
-	xref, trailerptr, trailer, err := readXref(r, b)
+	xrt, err = readXref(r, b)
 	if err != nil {
-		return nil, err
+		goto end
 	}
-	r.xref = xref
-	r.trailer = trailer
-	r.trailerptr = trailerptr
-	if trailer["Encrypt"] == nil {
-		return r, nil
+	r.xrefs = xrt.xrefs
+	r.trailer = xrt.dict
+	r.trailerPtr = xrt.objPtr
+	if xrt.dict["Encrypt"] == nil {
+		goto end
 	}
 	err = r.initEncrypt("")
 	if err == nil {
-		return r, nil
+		goto end
 	}
-	if pw == nil || err != ErrInvalidPassword {
-		return nil, err
+	if pw == nil {
+		goto end
+	}
+	if !errors.Is(err, ErrInvalidPassword) {
+		goto end
 	}
 	for {
 		next := pw()
@@ -182,10 +206,11 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (*Reader, e
 			break
 		}
 		if r.initEncrypt(next) == nil {
-			return r, nil
+			goto end
 		}
 	}
-	return nil, err
+end:
+	return r, err
 }
 
 // Trailer returns the file's Trailer value.
@@ -194,85 +219,140 @@ func (r *Reader) Trailer() Value {
 		return Value{}
 	}
 
-	return Value{r, r.trailerptr, r.trailer}
+	return Value{r, r.trailerPtr, r.trailer}
 }
 
-func readXref(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
+func readXref(r *Reader, b *buffer) (xrt xrefTable, err error) {
 	tok := b.readToken()
 	if tok == keyword("xref") {
-		return readXrefTable(r, b)
+		xrt, err = readXrefTable(r, b)
+		goto end
 	}
 	if _, ok := tok.(int64); ok {
 		b.unreadToken(tok)
-		return readXrefStream(r, b)
+		xrt, err = readXrefStream(r, b)
 	}
-	return nil, objptr{}, nil, fmt.Errorf("malformed PDF: cross-reference table not found: %v", tok)
+	err = fmt.Errorf("malformed PDF: cross-reference table not found: %v", tok)
+end:
+	return xrt, err
 }
 
-func readXrefStream(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
+func readXrefStream(r *Reader, b *buffer) (xrt xrefTable, err error) {
+	var strm stream
+	var ok bool
+	var obj objdef
+	var table []xref
+	var size int64
+	var strmType object
+
+	xrt = xrefTable{
+		xrefs:  nil,
+		objPtr: objptr{},
+		dict:   nil,
+	}
 	obj1, err := b.readObject()
 	if err != nil {
-		return nil, objptr{}, nil, err
+		err = errors.Join(ErrMalformedPDF.SeeOtherError, err)
+		goto end
 	}
-	obj, ok := obj1.(objdef)
+	obj, ok = obj1.(objdef)
 	if !ok {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: cross-reference table not found: %v", objfmt(obj1))
+		err = errors.Join(
+			ErrMalformedPDF.CrossRefTableNotFound,
+			ErrorArg("object", objFmt(obj1)),
+		)
+		goto end
 	}
-	strmptr := obj.ptr
-	strm, ok := obj.obj.(stream)
+	xrt.objPtr = obj.ptr
+	strm, ok = obj.obj.(stream)
 	if !ok {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: cross-reference table not found: %v", objfmt(obj))
+		err = errors.Join(
+			ErrMalformedPDF.CrossRefTableNotFound,
+			ErrorArg("object", objFmt(obj)),
+		)
+		goto end
 	}
-	if strm.hdr["Type"] != name("XRef") {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref stream does not have type XRef")
+	xrt.dict = strm.hdr
+	strmType, ok = xrt.dict["Type"]
+	if strmType != name("XRef") {
+		err = ErrMalformedPDF.XRefPrevStreamDoesNotHaveTypeXRef
+		goto end
 	}
-	size, ok := strm.hdr["Size"].(int64)
+	size, ok = xrt.dict["Size"].(int64)
 	if !ok {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref stream missing Size")
+		err = ErrMalformedPDF.XRefStreamMissingSize
+		goto end
 	}
-	table := make([]xref, size)
+	xrt.xrefs = make([]xref, size)
 
-	table, err = readXrefStreamData(r, strm, table, size)
+	xrt.xrefs, err = readXrefStreamData(r, strm, xrt.xrefs, size)
 	if err != nil {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %v", err)
+		err = errors.Join(ErrMalformedPDF.SeeOtherError, err)
+		goto end
 	}
 
-	for prevoff := strm.hdr["Prev"]; prevoff != nil; {
-		off, ok := prevoff.(int64)
+	for prevOfs := xrt.dict["Prev"]; prevOfs != nil; {
+		var ofs int64
+		var prevStrm stream
+
+		ofs, ok = prevOfs.(int64)
 		if !ok {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prevoff)
+			err = errors.Join(ErrMalformedPDF.XRefPrevNotAnInteger, ErrorArg("xref_previous_offset", prevOfs))
+			goto end
 		}
-		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
-		obj1, err := b.readObject()
+		b := newBuffer(io.NewSectionReader(r.f, ofs, r.end-ofs), ofs)
+		obj1, err = b.readObject()
 		if err != nil {
-			return nil, objptr{}, nil, err
+			err = errors.Join(ErrMalformedPDF.SeeOtherError, err)
+			goto end
 		}
-		obj, ok := obj1.(objdef)
+		obj, ok = obj1.(objdef)
 		if !ok {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref prev stream not found: %v", objfmt(obj1))
+			err = errors.Join(err, ErrMalformedPDF.XRefPrevStreamNotFound, ErrorArg("object", objFmt(obj1)))
+			goto end
 		}
-		prevstrm, ok := obj.obj.(stream)
+		prevStrm, ok = obj.obj.(stream)
 		if !ok {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref prev stream not found: %v", objfmt(obj))
+			err = errors.Join(err, ErrMalformedPDF.XRefPrevStreamNotFound, ErrorArg("object", objFmt(obj)))
+			goto end
 		}
-		prevoff = prevstrm.hdr["Prev"]
-		prev := Value{r, objptr{}, prevstrm}
+		prevOfs, ok = prevStrm.hdr["Prev"]
+		if !ok {
+			err = errors.Join(
+				ErrMalformedPDF.StreamHeaderHasNoPrevElement,
+				ErrorArg("prev_stream_headers", maps.Keys(prevStrm.hdr)),
+			)
+			goto end
+		}
+		prev := Value{r, objptr{}, prevStrm}
 		if prev.Kind() != Stream {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref prev stream is not stream: %v", prev)
+			err = errors.Join(
+				ErrMalformedPDF.XRefPrevStreamNotAStream,
+				ErrorArg("prev_value", prev),
+			)
+			goto end
 		}
 		if prev.Key("Type").Name() != "XRef" {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref prev stream does not have type XRef")
+			err = ErrMalformedPDF.XRefPrevStreamDoesNotHaveTypeXRef
+			goto end
 		}
-		psize := prev.Key("Size").Int64()
-		if psize > size {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref prev stream larger than last stream")
+		pSize := prev.Key("Size").Int64()
+		if pSize > size {
+			err = errors.Join(
+				ErrMalformedPDF.XRefPrevStreamLargerThanLastStream,
+				ErrorArg("prev_key_size", pSize),
+				ErrorArg("key_size", size),
+			)
+			goto end
 		}
-		if table, err = readXrefStreamData(r, prev.data.(stream), table, psize); err != nil {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: reading xref prev stream: %v", err)
+		xrt.xrefs, err = readXrefStreamData(r, prev.data.(stream), table, pSize)
+		if err != nil {
+			err = errors.Join(err, ErrMalformedPDF.ReadingXrefPrevStream)
+			goto end
 		}
 	}
-
-	return table, strmptr, strm.hdr, nil
+end:
+	return xrt, err
 }
 
 func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xref, error) {
@@ -281,7 +361,7 @@ func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xre
 		index = array{int64(0), size}
 	}
 	if len(index)%2 != 0 {
-		return nil, fmt.Errorf("invalid Index array %v", objfmt(index))
+		return nil, fmt.Errorf("invalid Index array %v", objFmt(index))
 	}
 	ww, ok := strm.hdr["W"].(array)
 	if !ok {
@@ -292,26 +372,26 @@ func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xre
 	for _, x := range ww {
 		i, ok := x.(int64)
 		if !ok || int64(int(i)) != i {
-			return nil, fmt.Errorf("invalid W array %v", objfmt(ww))
+			return nil, fmt.Errorf("invalid W array %v", objFmt(ww))
 		}
 		w = append(w, int(i))
 	}
 	if len(w) < 3 {
-		return nil, fmt.Errorf("invalid W array %v", objfmt(ww))
+		return nil, fmt.Errorf("invalid W array %v", objFmt(ww))
 	}
 
 	v := Value{r, objptr{}, strm}
-	wtotal := 0
+	wTotal := 0
 	for _, wid := range w {
-		wtotal += wid
+		wTotal += wid
 	}
-	buf := make([]byte, wtotal)
+	buf := make([]byte, wTotal)
 	data := v.Reader()
 	for len(index) > 0 {
 		start, ok1 := index[0].(int64)
 		n, ok2 := index[1].(int64)
 		if !ok1 || !ok2 {
-			return nil, fmt.Errorf("malformed Index pair %v %v %T %T", objfmt(index[0]), objfmt(index[1]), index[0], index[1])
+			return nil, fmt.Errorf("malformed Index pair %v %v %T %T", objFmt(index[0]), objFmt(index[1]), index[0], index[1])
 		}
 		index = index[2:]
 		for i := 0; i < int(n); i++ {
@@ -356,60 +436,88 @@ func decodeInt(b []byte) int {
 	return x
 }
 
-func readXrefTable(r *Reader, b *buffer) ([]xref, objptr, dict, error) {
-	var table []xref
+type xrefTable struct {
+	xrefs  []xref
+	objPtr objptr
+	dict   dict
+}
 
-	table, err := readXrefTableData(b, table)
+// readXrefTable returns an xrefTable
+func readXrefTable(r *Reader, b *buffer) (xrt xrefTable, err error) {
+	var res object
+	var ok bool
+	var size int64
+
+	xrt = xrefTable{objPtr: objptr{}}
+	xrt.xrefs, err = readXrefTableData(b, xrt.xrefs)
 	if err != nil {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %v", err)
+		err = errors.Join(ErrMalformedPDF.SeeOtherError, err)
+		goto end
 	}
 
-	res, err := b.readObject()
+	res, err = b.readObject()
 	if err != nil {
-		return nil, objptr{}, nil, err
+		err = errors.Join(ErrMalformedPDF.SeeOtherError, err)
+		goto end
 	}
 
-	trailer, ok := res.(dict)
+	xrt.dict, ok = res.(dict)
 	if !ok {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref table not followed by trailer dictionary")
+		err = ErrMalformedPDF.NoTrailerDictAfterXRefTable
+		goto end
 	}
 
-	for prevoff := trailer["Prev"]; prevoff != nil; {
-		off, ok := prevoff.(int64)
+	for {
+		var b *buffer
+		var tok token
+
+		prevOfs, ok := xrt.dict["Prev"]
 		if !ok {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prevoff)
+			break
 		}
-		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
-		tok := b.readToken()
+		off, ok := prevOfs.(int64)
+		if !ok {
+			err = errors.Join(
+				ErrMalformedPDF.XRefPrevNotAnInteger,
+				ErrorArg("xref_previous_offset", prevOfs),
+			)
+			goto end
+		}
+		b = newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
+		tok = b.readToken()
 		if tok != keyword("xref") {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev does not point to xref")
+			err = ErrMalformedPDF.XRefPrevDoesNotPointToXRef
+			goto end
 		}
-		table, err = readXrefTableData(b, table)
+		xrt.xrefs, err = readXrefTableData(b, xrt.xrefs)
 		if err != nil {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %v", err)
+			err = errors.Join(ErrMalformedPDF.SeeOtherError, err)
+			goto end
 		}
 
-		res, err := b.readObject()
+		res, err = b.readObject()
 		if err != nil {
-			return nil, objptr{}, nil, err
+			err = errors.Join(ErrMalformedPDF.SeeOtherError, err)
+			goto end
 		}
-		trailer, ok := res.(dict)
+		xrt.dict, ok = res.(dict)
 		if !ok {
-			return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref Prev table not followed by trailer dictionary")
+			err = ErrMalformedPDF.NoTrailerDictAfterXRefTable
+			goto end
 		}
-		prevoff = trailer["Prev"]
 	}
 
-	size, ok := trailer[name("Size")].(int64)
+	size, ok = xrt.dict[name("Size")].(int64)
 	if !ok {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: trailer missing /Size entry")
+		err = ErrMalformedPDF.TrailerMissingSizeEntry
+		goto end
 	}
 
-	if size < int64(len(table)) {
-		table = table[:size]
+	if size < int64(len(xrt.xrefs)) {
+		xrt.xrefs = xrt.xrefs[:size]
 	}
-
-	return table, objptr{}, trailer, nil
+end:
+	return xrt, err
 }
 
 func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
@@ -424,10 +532,10 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 			return nil, fmt.Errorf("malformed xref table")
 		}
 		for i := 0; i < int(n); i++ {
-			off, ok1 := b.readToken().(int64)
+			ofs, ok1 := b.readToken().(int64)
 			gen, ok2 := b.readToken().(int64)
 			alloc, ok3 := b.readToken().(keyword)
-			if !ok1 || !ok2 || !ok3 || alloc != keyword("f") && alloc != keyword("n") {
+			if !ok1 || !ok2 || !ok3 || alloc != "f" && alloc != "n" {
 				return nil, fmt.Errorf("malformed xref table")
 			}
 			x := int(start) + i
@@ -438,7 +546,7 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 				table = table[:x+1]
 			}
 			if alloc == "n" && table[x].offset == 0 {
-				table[x] = xref{ptr: objptr{uint32(x), uint16(gen)}, offset: int64(off)}
+				table[x] = xref{ptr: objptr{uint32(x), uint16(gen)}, offset: ofs}
 			}
 		}
 	}
@@ -447,16 +555,16 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 
 func findLastLine(buf []byte, s string) int {
 	bs := []byte(s)
-	max := len(buf)
+	maxLen := len(buf)
 	for {
-		i := bytes.LastIndex(buf[:max], bs)
+		i := bytes.LastIndex(buf[:maxLen], bs)
 		if i <= 0 || i+len(bs) >= len(buf) {
 			return -1
 		}
 		if (buf[i-1] == '\n' || buf[i-1] == '\r') && (buf[i+len(bs)] == '\n' || buf[i+len(bs)] == '\r') {
 			return i
 		}
-		max = i
+		maxLen = i
 	}
 }
 
@@ -517,10 +625,10 @@ func (v Value) Kind() ValueKind {
 // Note that String is not the accessor for values with Kind() == String.
 // To access such values, see RawString, Text, and TextFromUTF16.
 func (v Value) String() string {
-	return objfmt(v.data)
+	return objFmt(v.data)
 }
 
-func objfmt(x interface{}) string {
+func objFmt(x interface{}) string {
 	switch x := x.(type) {
 	default:
 		return fmt.Sprint(x)
@@ -550,7 +658,7 @@ func objfmt(x interface{}) string {
 			buf.WriteString("/")
 			buf.WriteString(k)
 			buf.WriteString(" ")
-			buf.WriteString(objfmt(elem))
+			buf.WriteString(objFmt(elem))
 		}
 		buf.WriteString(">>")
 		return buf.String()
@@ -562,19 +670,19 @@ func objfmt(x interface{}) string {
 			if i > 0 {
 				buf.WriteString(" ")
 			}
-			buf.WriteString(objfmt(elem))
+			buf.WriteString(objFmt(elem))
 		}
 		buf.WriteString("]")
 		return buf.String()
 
 	case stream:
-		return fmt.Sprintf("%v@%d", objfmt(x.hdr), x.offset)
+		return fmt.Sprintf("%v@%d", objFmt(x.hdr), x.offset)
 
 	case objptr:
 		return fmt.Sprintf("%d %d R", x.id, x.gen)
 
 	case objdef:
-		return fmt.Sprintf("{%d %d obj}%v", x.ptr.id, x.ptr.gen, objfmt(x.obj))
+		return fmt.Sprintf("{%d %d obj}%v", x.ptr.id, x.ptr.gen, objFmt(x.obj))
 	}
 }
 
@@ -622,7 +730,7 @@ func (v Value) RawString() string {
 	return x
 }
 
-// Text returns v's string value interpreted as a ``text string'' (defined in the PDF spec)
+// Text returns v's string value interpreted as a “text string” (defined in the PDF spec)
 // and converted to UTF-8.
 // If v.Kind() != String, Text returns the empty string.
 func (v Value) Text() string {
@@ -698,7 +806,7 @@ func (v Value) Keys() []string {
 		}
 		x = strm.hdr
 	}
-	keys := []string{} // not nil
+	keys := make([]string, 0) // not nil
 	for k := range x {
 		keys = append(keys, string(k))
 	}
@@ -706,15 +814,15 @@ func (v Value) Keys() []string {
 	return keys
 }
 
-// Index returns the i'th element in the array v.
+// Index returns the nth element in the array v.
 // If v.Kind() != Array or if i is outside the array bounds,
 // Index returns a null Value.
-func (v Value) Index(i int) Value {
+func (v Value) Index(n int) Value {
 	x, ok := v.data.(array)
-	if !ok || i < 0 || i >= len(x) {
+	if !ok || n < 0 || n >= len(x) {
 		return Value{}
 	}
-	return v.r.resolve(v.ptr, x[i])
+	return v.r.resolve(v.ptr, x[n])
 }
 
 // Len returns the length of the array v.
@@ -726,27 +834,27 @@ func (v Value) Len() int {
 	}
 	return len(x)
 }
-//
+
 // resolve xrefs
+//
 //	in: the parent and the key or reference to resolve
 //	out: the reference
 //
-//	bugfix: in case the object-ref is within a stream than nothing was returned 
-//
+//	bugfix: in case the object-ref is within a stream than nothing was returned
 func (r *Reader) resolve(parent objptr, x interface{}) Value {
 
 	if ptr, ok := x.(objptr); ok {
-		if ptr.id >= uint32(len(r.xref)) {
+		if ptr.id >= uint32(len(r.xrefs)) {
 			return Value{}
 		}
-		xref := r.xref[ptr.id]
+		xref := r.xrefs[ptr.id]
 		if xref.ptr != ptr || !xref.inStream && xref.offset == 0 {
 			return Value{}
 		}
 		// var obj object
 		if xref.inStream {
 			strm := r.resolve(parent, xref.stream)
-			
+
 		Search:
 			for {
 				if strm.Kind() != Stream {
@@ -764,14 +872,22 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 				b.allowEOF = true
 				for i := 0; i < n; i++ {
 					id, _ := b.readToken().(int64)
-					off, _ := b.readToken().(int64)
+					ofs, _ := b.readToken().(int64)
 					if uint32(id) == ptr.id {
-						b.seekForward(first + off)
-						objinstream, err := b.readObject()
+						err := b.seekForward(first + ofs)
+						if err != nil {
+							slog.Error(ErrFailedToSeekForwardInPDFFile.Error(), "to_offset", first+ofs)
+							return Value{
+								r:    nil,
+								ptr:  objptr{},
+								data: fmt.Sprintf("%s: to_offset=%d", ErrFailedToSeekForwardInPDFFile, first+ofs),
+							}
+						}
+						objInStream, err := b.readObject()
 						if err != nil {
 							return Value{}
 						}
-						x = objinstream
+						x = objInStream
 						break Search
 					}
 				}
@@ -808,9 +924,8 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 	case string:
 		return Value{r, parent, x}
 	default:
-		// panic(fmt.Errorf("unexpected value type %T in resolve", x))
-		fmt.Sprintf("unexpected value type %T in resolve", x)
-		return Value{}
+		slog.Error("unexpected value type in resolve", "type", fmt.Sprint("%T", x))
+		return Value{data: fmt.Sprint("ERROR: unexpected value type in resolve: type=%T", x)}
 	}
 }
 
@@ -828,7 +943,7 @@ func (e *errorReadCloser) Close() error {
 
 // Reader returns the data contained in the stream v.
 // If v.Kind() != Stream, Reader returns a ReadCloser that
-// responds to all reads with a ``stream not present'' error.
+// responds to all reads with a “stream not present” error.
 func (v Value) Reader() io.ReadCloser {
 	x, ok := v.data.(stream)
 	if !ok {
@@ -854,7 +969,7 @@ func (v Value) Reader() io.ReadCloser {
 		}
 	}
 
-	return ioutil.NopCloser(rd)
+	return io.NopCloser(rd)
 }
 
 func applyFilter(rd io.Reader, name string, param Value) io.Reader {
@@ -932,7 +1047,7 @@ func (r *Reader) initEncrypt(password string) error {
 	// See PDF 32000-1:2008, §7.6.
 	encrypt, _ := r.resolve(objptr{}, r.trailer["Encrypt"]).data.(dict)
 	if encrypt["Filter"] != name("Standard") {
-		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(encrypt["Filter"]))
+		return fmt.Errorf("unsupported PDF: encryption filter %v", objFmt(encrypt["Filter"]))
 	}
 	n, _ := encrypt["Length"].(int64)
 	if n == 0 {
@@ -943,18 +1058,18 @@ func (r *Reader) initEncrypt(password string) error {
 	}
 	V, _ := encrypt["V"].(int64)
 	if V != 1 && V != 2 && (V != 4 || !okayV4(encrypt)) {
-		return fmt.Errorf("unsupported PDF: encryption version V=%d; %v", V, objfmt(encrypt))
+		return fmt.Errorf("unsupported PDF: encryption version V=%d; %v", V, objFmt(encrypt))
 	}
 
 	ids, ok := r.trailer["ID"].(array)
 	if !ok || len(ids) < 1 {
 		return fmt.Errorf("malformed PDF: missing ID in trailer")
 	}
-	idstr, ok := ids[0].(string)
+	idStr, ok := ids[0].(string)
 	if !ok {
 		return fmt.Errorf("malformed PDF: missing ID in trailer")
 	}
-	ID := []byte(idstr)
+	ID := []byte(idStr)
 
 	R, _ := encrypt["R"].(int64)
 	if R < 2 {
@@ -982,7 +1097,7 @@ func (r *Reader) initEncrypt(password string) error {
 	}
 	h.Write([]byte(O))
 	h.Write([]byte{byte(P), byte(P >> 8), byte(P >> 16), byte(P >> 24)})
-	h.Write([]byte(ID))
+	h.Write(ID)
 	key := h.Sum(nil)
 
 	if R >= 3 {
@@ -1009,7 +1124,7 @@ func (r *Reader) initEncrypt(password string) error {
 	} else {
 		h.Reset()
 		h.Write(passwordPad)
-		h.Write([]byte(ID))
+		h.Write(ID)
 		u = h.Sum(nil)
 		c.XORKeyStream(u, u)
 
@@ -1041,25 +1156,25 @@ func okayV4(encrypt dict) bool {
 	if !ok {
 		return false
 	}
-	stmf, ok := encrypt["StmF"].(name)
+	stmF, ok := encrypt["StmF"].(name)
 	if !ok {
 		return false
 	}
-	strf, ok := encrypt["StrF"].(name)
+	strF, ok := encrypt["StrF"].(name)
 	if !ok {
 		return false
 	}
-	if stmf != strf {
+	if stmF != strF {
 		return false
 	}
-	cfparam, ok := cf[stmf].(dict)
-	if cfparam["AuthEvent"] != nil && cfparam["AuthEvent"] != name("DocOpen") {
+	cfParam, ok := cf[stmF].(dict)
+	if cfParam["AuthEvent"] != nil && cfParam["AuthEvent"] != name("DocOpen") {
 		return false
 	}
-	if cfparam["Length"] != nil && cfparam["Length"] != int64(16) {
+	if cfParam["Length"] != nil && cfParam["Length"] != int64(16) {
 		return false
 	}
-	if cfparam["CFM"] != name("AESV2") {
+	if cfParam["CFM"] != name("AESV2") {
 		return false
 	}
 	return true
@@ -1096,7 +1211,10 @@ func decryptStream(key []byte, useAES bool, ptr objptr, rd io.Reader) io.Reader 
 			panic("AES: " + err.Error())
 		}
 		iv := make([]byte, 16)
-		io.ReadFull(rd, iv)
+		_, err = io.ReadFull(rd, iv)
+		if err != nil {
+			panic("ERROR reading" + err.Error())
+		}
 		cbc := cipher.NewCBCDecrypter(cb, iv)
 		rd = &cbcReader{cbc: cbc, rd: rd, buf: make([]byte, 16)}
 	} else {

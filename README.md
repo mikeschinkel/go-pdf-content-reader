@@ -10,7 +10,7 @@ Features
 
 ## Install:
 
-`go get -u github.com/dslipak/pdf`
+`go get -u github.com/mikeschinkel/go-pdf-content-reader`
 
 
 ## Read plain text
@@ -22,7 +22,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/dslipak/pdf"
+	"github.com/mikeschinkel/go-pdf-content-reader"
 )
 
 func main() {
@@ -36,18 +36,17 @@ func main() {
 }
 
 func readPdf(path string) (string, error) {
-	f, r, err := pdf.Open(path)
-	// remember close file
-    defer f.Close()
+	r, err := pdf.Open(path)
 	if err != nil {
 		return "", err
 	}
+   defer r.Close()
 	var buf bytes.Buffer
-    b, err := r.GetPlainText()
-    if err != nil {
-        return "", err
-    }
-    buf.ReadFrom(b)
+   b, err := r.GetPlainText()
+   if err != nil {
+      return "", err
+   }
+   buf.ReadFrom(b)
 	return buf.String(), nil
 }
 ```
@@ -94,7 +93,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/dslipak/pdf"
+	"github.com/mikeschinkel/go-pdf-content-reader"
 )
 
 func main() {
@@ -107,9 +106,9 @@ func main() {
 }
 
 func readPdf(path string) (string, error) {
-	f, r, err := pdf.Open(path)
+	r, err := pdf.Open(path)
 	defer func() {
-		_ = f.Close()
+      _ = r.Close()
 	}()
 	if err != nil {
 		return "", err
