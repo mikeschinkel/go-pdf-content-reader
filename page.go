@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 )
@@ -59,10 +58,10 @@ func (r *Reader) NumPage() int {
 	return int(r.Trailer().Key("Root").Key("Pages").Key("Count").Int64())
 }
 
-// GetPlainText returns all the text in the PDF file
-func (r *Reader) GetPlainText() (reader io.Reader, err error) {
+// GetPlainTextLines returns all the text in the PDF file
+func (r *Reader) GetPlainTextLines() (textLines []string, err error) {
 	pages := r.NumPage()
-	var buf bytes.Buffer
+	//var buf bytes.Buffer
 	fonts := make(map[string]*Font)
 	for i := 1; i <= pages; i++ {
 		p := r.Page(i)
@@ -72,13 +71,15 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 				fonts[name] = &f
 			}
 		}
-		text, err := p.GetPlainText(fonts)
+		lines, err := p.GetPlainTextLines(fonts)
 		if err != nil {
-			return &bytes.Buffer{}, err
+			goto end
 		}
-		buf.WriteString(text)
+		textLines = append(textLines, lines...)
+		//buf.WriteString(text)
 	}
-	return &buf, nil
+end:
+	return textLines, nil
 }
 
 func (p Page) findInherited(key string) Value {
@@ -460,12 +461,12 @@ type gstate struct {
 	CTM   matrix
 }
 
-// GetPlainText returns the page's all text without format.
+// GetPlainTextLines returns the page's all text without format.
 // fonts can be passed in (to improve parsing performance) or left nil
-func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
+func (p Page) GetPlainTextLines(fonts map[string]*Font) (result []string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			result = ""
+			result = []string{""}
 			err = errors.New(fmt.Sprint(r))
 		}
 	}()
@@ -481,14 +482,17 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 		}
 	}
 
-	var textBuilder bytes.Buffer
-	showText := func(s string) {
+	var content []string
+
+	showText := func(s string) string {
+		var textBuilder bytes.Buffer
 		for _, ch := range enc.Decode(s) {
 			_, err := textBuilder.WriteRune(ch)
 			if err != nil {
 				panic(err)
 			}
 		}
+		return textBuilder.String()
 	}
 
 	Interpret(strm, func(stk *Stack, op string) {
@@ -502,7 +506,8 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 		default:
 			return
 		case "T*": // move to start of next line
-			showText("\n")
+			content = append(content, showText("\n"))
+
 		case "Tf": // set text font and size
 			if len(args) != 2 {
 				panic("bad TL")
@@ -518,6 +523,7 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 			}
 			fallthrough
 		case "'": // move to next line and show text
+			content = append(content, "\n")
 			if len(args) != 1 {
 				panic("bad ' operator")
 			}
@@ -526,18 +532,21 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 			if len(args) != 1 {
 				panic("bad Tj operator")
 			}
-			showText(args[0].RawString())
+			content = append(content, showText(args[0].RawString()))
 		case "TJ": // show text, allowing individual glyph positioning
+			var textBuilder bytes.Buffer
 			v := args[0]
 			for i := 0; i < v.Len(); i++ {
 				x := v.Index(i)
 				if x.Kind() == String {
-					showText(x.RawString())
+					textBuilder.WriteString(showText(x.RawString()))
 				}
 			}
+			textBuilder.WriteString("\n")
+			content = append(content, textBuilder.String())
 		}
 	})
-	return textBuilder.String(), nil
+	return content, nil
 }
 
 // Column represents the contents of a column
@@ -752,18 +761,18 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 		}
 	})
 }
-//
+
 // Content returns the page's content.
 //
-// bugfix: 
+// bugfix:
+//
 //	the /Content may contain an array of refs
 //	this leads to an endless loop
-//
 func (p Page) Content() Content {
-	
+
 	var text []Text
 	var rect []Rect
-	
+
 	//fmt.Println("page=",p)
 	strm := p.V.Key("Contents")
 
@@ -779,7 +788,7 @@ func (p Page) Content() Content {
 			c := p.readContent(strmindex)
 			text = append(text, c.Text...)
 			rect = append(rect, c.Rect...)
-		}	
+		}
 	}
 	return Content{text, rect}
 }
@@ -791,7 +800,7 @@ func (p Page) readContent(strm Value) Content {
 		Th:  1,
 		CTM: ident,
 	}
-	
+
 	var text []Text
 	showText := func(s string) {
 		n := 0
@@ -872,7 +881,7 @@ func (p Page) readContent(strm Value) Content {
 
 		case "Q": // restore graphics state
 			n := len(gstack) - 1
-			if n >= 0 {	// bugfix: don't raise an exception
+			if n >= 0 { // bugfix: don't raise an exception
 				g = gstack[n]
 				gstack = gstack[:n]
 			}
@@ -944,7 +953,7 @@ func (p Page) readContent(strm Value) Content {
 			showText(args[0].RawString())
 
 		case "TJ": // show text, allowing individual glyph positioning
-			if len(args) > 0 {	// bugfix: don't raise an exception
+			if len(args) > 0 { // bugfix: don't raise an exception
 				v := args[0]
 				for i := 0; i < v.Len(); i++ {
 					x := v.Index(i)
