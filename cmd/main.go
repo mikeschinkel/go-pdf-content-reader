@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 
@@ -35,5 +36,12 @@ func main() {
 end:
 	if err != nil {
 		slog.Error(err.Error())
+	}
+}
+
+func mustClose(c io.Closer) {
+	err := c.Close()
+	if err != nil {
+		slog.Error("ERROR: Failed to close", "error", "err")
 	}
 }

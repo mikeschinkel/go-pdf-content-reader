@@ -1,134 +1,56 @@
 # PDF Reader
 
-A simple Go library which enables reading PDF files. 
-
-This repository contains merged code from https://github.com/rsc/pdf and https://github.com/ledongthuc/pdf
-
-Features
-  - Get plain text content (without formatting)
-  - Get Content (including all font and formatting information)
-
-## Install:
-
-`go get -u github.com/mikeschinkel/go-pdf-content-reader`
-
+This is a quick-and-dirty proof-of-concept to read text content from a PDF file, including the 
+line breaks.  See the repo I forked this from for more info on the original sources. 
 
 ## Read plain text
+This is the `main.go` in the `/cmd` directory. To try it run `make`. 
 
 ```golang
 package main
 
 import (
-	"bytes"
 	"fmt"
+	"io"
+	"log/slog"
+	"strings"
 
-	"github.com/mikeschinkel/go-pdf-content-reader"
+	pdf "github.com/mikeschinkel/go-pdf-content-reader"
 )
 
+const filename = "test.pdf"
+
 func main() {
-	pdf.DebugOn = true
-	content, err := readPdf("test.pdf") // Read local pdf file
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println(content)
-	return
-}
+	var err error
+	var pdfRdr *pdf.Reader
+	//var ioRdr io.Reader
+	var lines []string
+	var sb strings.Builder
 
-func readPdf(path string) (string, error) {
-	r, err := pdf.Open(path)
-	if err != nil {
-		return "", err
-	}
-   defer r.Close()
-	var buf bytes.Buffer
-   b, err := r.GetPlainText()
-   if err != nil {
-      return "", err
-   }
-   buf.ReadFrom(b)
-	return buf.String(), nil
-}
-```
-
-## Read all text with styles from PDF
-
-```golang
-func readPdf2(path string) (string, error) {
-	f, r, err := pdf.Open(path)
+	pdfRdr, err = pdf.Open(filename)
 	// remember close file
-	defer f.Close()
+	defer mustClose(pdfRdr)
 	if err != nil {
-		return "", err
+		goto end
 	}
-	totalPage := r.NumPage()
 
-	for pageIndex := 1; pageIndex <= totalPage; pageIndex++ {
-		p := r.Page(pageIndex)
-		if p.V.IsNull() {
-			continue
-		}
-		var lastTextStyle pdf.Text
-		texts := p.Content().Text
-		for _, text := range texts {
-			if isSameSentence(text, lastTextStyle) {
-				lastTextStyle.S = lastTextStyle.S + text.S
-			} else {
-				fmt.Printf("Font: %s, Font-size: %f, x: %f, y: %f, content: %s \n", lastTextStyle.Font, lastTextStyle.FontSize, lastTextStyle.X, lastTextStyle.Y, lastTextStyle.S)
-				lastTextStyle = text
-			}
-		}
-	}
-	return "", nil
-}
-```
-
-
-## Read text grouped by rows
-
-```golang
-package main
-
-import (
-	"fmt"
-	"os"
-
-	"github.com/mikeschinkel/go-pdf-content-reader"
-)
-
-func main() {
-	content, err := readPdf(os.Args[1]) // Read local pdf file
+	lines, err = pdfRdr.GetPlainTextLines()
 	if err != nil {
-		panic(err)
+		goto end
 	}
-	fmt.Println(content)
-	return
+	for i, line := range lines {
+		sb.WriteString(fmt.Sprintf("%d. — %s\n", i, strings.TrimRight(line, "\n")))
+	}
+	fmt.Print(sb.String())
+end:
+	if err != nil {
+		slog.Error(err.Error())
+	}
 }
 
-func readPdf(path string) (string, error) {
-	r, err := pdf.Open(path)
-	defer func() {
-      _ = r.Close()
-	}()
+func mustClose(c io.Closer) {
+	err := c.Close()
 	if err != nil {
-		return "", err
+		slog.Error("ERROR: Failed to close", "error", "err")
 	}
-	totalPage := r.NumPage()
-
-	for pageIndex := 1; pageIndex <= totalPage; pageIndex++ {
-		p := r.Page(pageIndex)
-		if p.V.IsNull() {
-			continue
-		}
-
-		rows, _ := p.GetTextByRow()
-		for _, row := range rows {
-		    println(">>>> row: ", row.Position)
-		    for _, word := range row.Content {
-		        fmt.Println(word.S)
-		    }
-		}
-	}
-	return "", nil
-}
-```
+}```
